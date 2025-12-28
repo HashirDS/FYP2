@@ -9,3 +9,6 @@ transformers
 torch
 datasets
 accelerate
+gunicorn      
+groq         
+replicate
