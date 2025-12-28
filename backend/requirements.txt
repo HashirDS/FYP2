@@ -1,0 +1,11 @@
+flask
+flask-cors
+pymongo
+flask-bcrypt
+python-dotenv
+validators
+requests
+transformers
+torch
+datasets
+accelerate
