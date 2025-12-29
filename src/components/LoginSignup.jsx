@@ -5,7 +5,7 @@ import { useNavigate } from 'react-router-dom';
 import { Mail, Lock, User, UserPlus, GraduationCap, Users } from 'lucide-react';
 
 // Configuration
-const API_URL = 'http://127.0.0.1:5000'; // Match the Flask backend URL
+const API_URL = 'https://fyp2-jwrb.onrender.com'; // Match the Flask backend URL
 
 // --- Input Field Component (Helper) ---
 const InputField = ({ Icon, type, name, value, onChange, placeholder, required = true }) => (

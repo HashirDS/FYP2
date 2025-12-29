@@ -417,28 +417,44 @@ import os
 import replicate  # <--- New Import
 from flask import Flask, request, jsonify
 
-# ---------------------------------------------------------
 REPLICATE_MODEL_ID = "hashirds/ashir:6b0013266a78c6c8890f033dbce522a9e6477cc8eb5af4ca2e2fb4b5d638be06"
 groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
-# --- NEW: Helper Function to Clean Repetitive Text ---
+# --- HELPER: Clean Repetitive Text ---
 def clean_tutor_response(text):
-    """
-    Stops the model from praising the user endlessly.
-    Keeps the first 2 sentences or splits before the praise loop starts.
-    """
-    # Common looping phrases to cut off
     cut_off_phrases = [
         "Perfect work!", "Fantastic!", "You're a superstar!", 
-        "Incredible job!", "You're amazing!", "Bravo!"
+        "Incredible job!", "You're amazing!", "Bravo!", "Lesson completed"
     ]
-    
     for phrase in cut_off_phrases:
         if phrase in text:
-            # Keep text ONLY before the first occurrence of a praise loop
             text = text.split(phrase)[0]
-    
     return text.strip()
+
+# --- NEW: HELPER: Check if Response is Valid ---
+def is_response_valid(user_prompt, response_text):
+    """
+    Returns False if the model gave a lazy or bad answer.
+    """
+    response_lower = response_text.lower()
+    
+    # 1. Check for "Lazy" completion phrases
+    bad_phrases = ["completed", "lesson done", "task finished", "end of lesson"]
+    for phrase in bad_phrases:
+        if phrase in response_lower and len(response_text.split()) < 10:
+            return False # Reject "12 months completed"
+
+    # 2. Check Length vs Prompt Complexity
+    # If user asks for a list (e.g., "12 months", "3 letters"), answer shouldn't be tiny.
+    if "12" in user_prompt or "list" in user_prompt:
+        if len(response_text.split()) < 5:
+            return False # Answer is suspiciously short
+
+    # 3. Check for Empty/Gibberish
+    if not response_text or len(response_text) < 3:
+        return False
+
+    return True
 
 @app.route('/api/ai', methods=['GET'])
 def ask_ai():
@@ -447,12 +463,20 @@ def ask_ai():
         return jsonify({"error": "Missing 'question' parameter"}), 400
 
     # ---------------------------------------------------------
-    # SYSTEM PROMPT
+    # SYSTEM PROMPT (Shared by both models for consistency)
     # ---------------------------------------------------------
     system_instruction_text = """
-    You are an expert Kindergarten Teacher.
-    Give a VERY SHORT answer (1-2 sentences).
-    Do NOT repeat yourself. Stop talking after the answer.
+    You are an expert Kindergarten Teacher (Ages 3-6).
+    
+    RULES:
+    1. Answer the question DIRECTLY.
+    2. If asked for a list (like months or ABCs), LIST THEM ALL.
+    3. Keep it simple and fun using Emojis 🌟.
+    4. Do not just say "Task completed". Actually teach the topic.
+    
+    Example:
+    User: "Teach me 12 months"
+    Teacher: "Here they are! January, February, March, April, May, June, July, August, September, October, November, December! 📅"
     """
 
     # ---------------------------------------------------------
@@ -465,31 +489,32 @@ def ask_ai():
             REPLICATE_MODEL_ID,
             input={
                 "prompt": f"{system_instruction_text}\nUser: {question}\nTeacher:",
-                "max_new_tokens": 75,       # <--- REDUCED to stop loops
-                "temperature": 0.5,         # Lower = More focused
+                "max_new_tokens": 150,      
+                "temperature": 0.5,         
                 "top_p": 0.9,
-                "repetition_penalty": 1.5,  # High penalty for repeats
-                "stop_sequences": ["User:", "\n\n", "Teacher:", "Perfect work!"] # Force stop
+                "repetition_penalty": 1.2,
+                "stop_sequences": ["User:", "\n\n", "Teacher:"] 
             }
         )
 
         generated_text = "".join(output)
 
-        # Cleanup prefixes
+        # Cleanup
         if "Teacher:" in generated_text:
             generated_text = generated_text.split("Teacher:")[-1].strip()
-
-        # --- APPLY NEW CLEANER ---
+        
         generated_text = clean_tutor_response(generated_text)
 
-        # Fallback Check: If empty or still loops
-        if not generated_text or len(generated_text) < 5: 
-            raise ValueError("Response too short or empty")
+        # --- VALIDATION STEP ---
+        # If the answer is lazy (e.g. "12 months completed"), this returns False
+        if not is_response_valid(question, generated_text):
+            print(f"⚠️ Invalid Replicate Response detected: '{generated_text}'")
+            raise ValueError("Response failed validation check")
         
         return jsonify({"text": generated_text, "source": "replicate_custom"})
 
     except Exception as e:
-        print(f"⚠️ Replicate Issue ({e}). Fallback to Llama 3 (Groq)...")
+        print(f"⚠️ Replicate failed/rejected ({e}). Switching to Llama 3...")
 
     # ---------------------------------------------------------
     # 2. FALLBACK: GROQ (Llama 3)
@@ -498,17 +523,24 @@ def ask_ai():
         if 'groq_client' not in globals() or not groq_client:
             raise ValueError("Groq client not initialized")
 
+        print("🔁 Using Groq (Llama 3) fallback...")
+        
         completion = groq_client.chat.completions.create(
             messages=[
                 {"role": "system", "content": system_instruction_text},
                 {"role": "user", "content": question}
             ],
             model="llama-3.3-70b-versatile",
-            temperature=0.5,
-            max_tokens=200
+            temperature=0.6,
+            max_tokens=300, 
+            top_p=1.0
         )
 
         fallback_text = completion.choices[0].message.content.strip()
+        
+        # Apply the same cleaning to Llama 3 just in case
+        fallback_text = clean_tutor_response(fallback_text)
+        
         print(f"✅ Served via Groq: {fallback_text[:50]}...")
         return jsonify({"text": fallback_text, "source": "groq_llama3"})
 
@@ -519,7 +551,6 @@ def ask_ai():
             "source": "error_fallback"
         })
 
-# Your Custom Model on Replicate (Updated with new hash)
 
 # -----------------------------------------------------
 # --- /api/tts Route (Azure TTS with SSML for speed) ---
@@ -1054,11 +1085,17 @@ def get_speech_analytics(user_id):
 # --- NEW CHATBOT ENDPOINT FOR LEARNING ASSISTANT ---
 # -----------------------------------------------------
 
+import os
+from groq import Groq  # Make sure to install this: pip install groq
+import google.generativeai as genai
+
+# ... existing imports ...
+
 @app.route('/api/chat', methods=['POST'])
 def chat_assistant():
     """
-    Smart Learning System Chatbot - Provides accurate answers about your educational system
-    Uses Gemini API with educational context for child-friendly responses
+    Smart Learning System Chatbot - Powered by Llama 3 (via Groq)
+    Fallback: Gemini Flash -> Rule Based
     """
     try:
         data = request.get_json()
@@ -1068,149 +1105,100 @@ def chat_assistant():
         if not user_message:
             return jsonify({"error": "No message provided"}), 400
 
-        # Get current page context for better responses
-        current_page = context.get('current_page', '')
-        user_id = context.get('user_id', '')
+        # Get context
+        current_page = context.get('current_page', 'Home')
         
-        # Enhanced system prompt for educational chatbot
+        # --- 1. DEFINE THE PERSONA (SYSTEM PROMPT) ---
         system_prompt = f"""
-        You are "Learning Buddy", a friendly educational assistant for children aged 3-6 in the Smart Learning System.
-
-        **ABOUT OUR SYSTEM:**
-        - We have a 3D AI Teacher with real-time animations and interactions
-        - Voice recognition system for speaking practice
-        - Interactive lessons: ABCs, Numbers, Shapes, Colors, Poems, Drawing
-        - Progress tracking with scores and rewards
-        - Child-friendly interface with games and activities
-
-        **CURRENT CONTEXT:**
-        - User is on: {current_page if current_page else 'general learning page'}
-        - Available features: 3D Avatar, Voice Practice, Drawing Board, Educational Games
-
-        **RESPONSE GUIDELINES:**
-        - Use simple, short sentences (1-2 lines max)
-        - Be encouraging, positive, and playful
-        - Include relevant emojis for engagement
-        - Focus on educational content only
-        - Guide users to explore system features
-        - Never provide personal advice or non-educational content
-
-        **SPECIFIC FEATURE EXPLANATIONS:**
-        - 3D AI Teacher: "Interactive 3D character that teaches with animations and voice"
-        - Voice System: "Speak and the system listens to help you practice pronunciation"
-        - Drawing Board: "Draw and learn shapes, colors, and creativity"
-        - Progress Tracking: "Earn stars and points for completing lessons"
-
-        User Question: {user_message}
+        You are "Learning Buddy", a cheerful and friendly AI assistant for children (ages 3-6) using the "Smart Learning System".
+        
+        **YOUR SYSTEM KNOWLEDGE (Use this to answer):**
+        1. **3D AI Teacher:** An animated character that talks and teaches lessons visually.
+        2. **Voice Practice:** Kids can speak into the microphone to practice pronunciation (uses Azure/Deepgram).
+        3. **Drawing Board:** A digital canvas for creativity, shapes, and colors.
+        4. **Games:** Interactive ABC, Number, and Color games.
+        
+        **CURRENT USER CONTEXT:**
+        - User is looking at: {current_page} page.
+        
+        **RULES FOR ANSWERING:**
+        - Keep answers SHORT (maximum 2 sentences).
+        - Use simple words a 5-year-old understands.
+        - Be super enthusiastic! Use emojis like 🌟, 🎨, 🚀, 🤖.
+        - If asked about features, explain them simply.
+        - If asked a general question (e.g., "What is A?"), give an educational answer ("A is for Apple! 🍎").
         """
 
-        # Try Gemini API first (you already have this configured)
-        if GEMINI_API_KEY:
+        # --- 2. PRIMARY: TRY GROQ (LLAMA 3) ---
+        # This is the fastest and best model for chat
+        groq_api_key = os.getenv("GROQ_API_KEY")
+        if groq_api_key:
             try:
-                client = genai.Client(api_key=GEMINI_API_KEY)
-                
-                response = client.models.generate_content(
-                    model="gemini-2.0-flash",
-                    contents=user_message,
-                    config={
-                        "system_instruction": system_prompt,
-                        "max_output_tokens": 150,
-                        "temperature": 0.7
-                    }
+                client = Groq(api_key=groq_api_key)
+                completion = client.chat.completions.create(
+                    model="llama3-8b-8192",  # Fast and smart
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message}
+                    ],
+                    temperature=0.7,
+                    max_tokens=150,
                 )
-                
+                bot_response = completion.choices[0].message.content
+                print(f"🚀 Groq Response: {bot_response}")
+                return jsonify({
+                    "reply": bot_response,
+                    "source": "llama-3",
+                    "type": "ai"
+                })
+            except Exception as e:
+                print(f"⚠️ Groq failed, switching to backup: {e}")
+
+        # --- 3. BACKUP: TRY GEMINI (FLASH) ---
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        if gemini_api_key:
+            try:
+                genai.configure(api_key=gemini_api_key)
+                model = genai.GenerativeModel('gemini-1.5-flash') # Use 1.5 Flash (faster/stable)
+                response = model.generate_content(
+                    f"{system_prompt}\n\nUSER QUESTION: {user_message}"
+                )
                 bot_response = response.text.strip()
-                print(f"🤖 ChatBot Response: {bot_response}")
+                print(f"🤖 Gemini Response: {bot_response}")
                 return jsonify({
                     "reply": bot_response,
                     "source": "gemini",
                     "type": "ai"
                 })
-                
             except Exception as e:
-                print(f"❌ Gemini chat failed: {e}")
+                print(f"⚠️ Gemini failed: {e}")
 
-        # Fallback to your existing Hugging Face API
-        try:
-            headers = {
-                "Authorization": f"Bearer {HUGGINGFACE_API_TOKEN}",
-                "Content-Type": "application/json"
-            }
-
-            payload = {
-                "inputs": f"{system_prompt}\n\nUser: {user_message}",
-                "parameters": {
-                    "max_new_tokens": 100,
-                    "temperature": 0.7,
-                    "top_p": 0.9
-                }
-            }
-
-            response = requests.post(HF_MODEL_URL, headers=headers, json=payload, timeout=15)
-            response.raise_for_status()
-            result = response.json()
-
-            if isinstance(result, list) and "generated_text" in result[0]:
-                fallback_response = result[0]["generated_text"]
-            else:
-                fallback_response = result.get("generated_text", "I'm here to help you learn!")
-
-            # Clean up the response
-            fallback_response = fallback_response.strip().replace("\n", " ")
-            print(f"🤖 Fallback ChatBot Response: {fallback_response}")
-            
-            return jsonify({
-                "reply": fallback_response,
-                "source": "huggingface", 
-                "type": "ai"
-            })
-
-        except Exception as e:
-            print(f"❌ All AI models failed: {e}")
-
-        # Ultimate fallback - rule-based responses
-        fallback_responses = {
-            # System features
-            "3d": "We have an amazing 3D AI Teacher! 🤖 It's a friendly character that teaches with animations and talks to you! Try the 'AI Teacher' page to see it!",
-            "voice": "Our voice system lets you speak and practice! 🗣️ Just talk and the system will listen and help you learn pronunciation!",
-            "draw": "The Drawing Board is so much fun! 🎨 You can draw shapes, colors, and be creative! Find it in the learning menu!",
-            "learn": "Let's learn together! 📚 We have ABCs, Numbers, Shapes, Colors, and fun Poems! Which one would you like to try?",
-            
-            # Learning topics
-            "abc": "ABC lessons are so fun! 🔤 We learn letters with games and sounds. A is for Apple, B is for Ball! Ready to learn?",
-            "number": "Numbers are everywhere! 🔢 Let's count 1, 2, 3 and play counting games together!",
-            "shape": "Shapes are all around us! 🔺 We have circles, squares, triangles! Can you find shapes in your room?",
-            "color": "Colors make the world beautiful! 🌈 Let's learn red, blue, green, and all the rainbow colors!",
-            
-            # General help
-            "help": "I can help you explore our Smart Learning System! 🚀 We have 3D teacher, voice practice, drawing, and fun lessons! What would you like to know?",
-            "hi": "Hello! 👋 I'm Learning Buddy! I can tell you about our 3D teacher, voice system, and all the fun learning games! What would you like to explore?",
-            "hello": "Hi there! 🌟 Welcome to Smart Learning! We have so many fun ways to learn - 3D characters, voice games, drawing, and more!",
+        # --- 4. ULTIMATE FALLBACK: RULE BASED ---
+        # If both AIs fail, use pre-written answers so the user never gets an error.
+        user_lower = user_message.lower()
+        
+        fallback_map = {
+            "teacher": "Our 3D Teacher is super smart! 🤖 She can talk to you and teach you fun lessons!",
+            "voice": "I love listening to you! 🎤 Click the microphone button to practice speaking!",
+            "draw": "Time to be an artist! 🎨 Go to the Drawing Board to paint shapes and colors.",
+            "game": "We have so many games! 🎮 You can play with Numbers, ABCs, and Colors.",
+            "hello": "Hi there, little friend! 👋 I'm ready to learn with you!",
+            "hi": "Hello! 🌟 What do you want to learn today?"
         }
 
-        user_lower = user_message.lower()
-        for keyword, response in fallback_responses.items():
-            if keyword in user_lower:
-                return jsonify({
-                    "reply": response,
-                    "source": "rule_based",
-                    "type": "system"
-                })
+        for key, reply in fallback_map.items():
+            if key in user_lower:
+                return jsonify({"reply": reply, "source": "offline_rules", "type": "system"})
 
-        # Default response
         return jsonify({
-            "reply": "I'm here to help you learn! 🌟 Try asking about our 3D teacher, voice system, or ABC lessons! What would you like to explore?",
+            "reply": "I am ready to learn! 🌟 Ask me about the 3D Teacher, Drawing, or Games!",
             "source": "default",
             "type": "system"
         })
 
     except Exception as e:
-        print(f"❌ Chat endpoint error: {e}")
-        return jsonify({
-            "reply": "I'm taking a little break! 😊 Try asking me about our learning features or lessons!",
-            "source": "error",
-            "type": "system"
-        }), 500
+        print(f"❌ Critical Chat Error: {e}")
+        return jsonify({"reply": "I'm having a little nap... 😴 Try again in a minute!", "source": "error"}), 500
   # =============================================================
 # --- START: NEW QUIZ SYSTEM ENDPOINTS (Teacher & Student) ---
 # =============================================================
@@ -1646,6 +1634,6 @@ if __name__ == "__main__":
     print(f"Azure TTS: {'✅ Available' if SPEECH_KEY and SPEECH_REGION else '❌ Not configured'}")
     print(f"ElevenLabs TTS: {'✅ Available' if ELEVENLABS_API_KEY else '❌ Not configured'}")
     print("Browser TTS: ✅ Always available")
-    print("Custom Model: ❌ Not implemented yet")
     print(f"Groq Speech API: {'✅ Available' if groq_client else '❌ Not configured'}")
+    print(f"Phi-2 model: Available")
     app.run(port=5000, debug=True)
